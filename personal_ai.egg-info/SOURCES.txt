@@ -1,0 +1,12 @@
+README.md
+setup.py
+app/__init__.py
+app/main.py
+personal_ai.egg-info/PKG-INFO
+personal_ai.egg-info/SOURCES.txt
+personal_ai.egg-info/dependency_links.txt
+personal_ai.egg-info/requires.txt
+personal_ai.egg-info/top_level.txt
+tests/__init__.py
+tests/conftest.py
+tests/test_conversation.py
