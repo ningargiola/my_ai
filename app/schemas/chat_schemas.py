@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 class MessageBase(BaseModel):
@@ -41,4 +41,17 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     """Response schema for chat messages."""
     conversation_id: int
-    response: str 
+    response: str
+    analysis: Optional[Dict[str, Any]] = None
+
+class WebSocketMessage(BaseModel):
+    """Schema for WebSocket messages."""
+    type: str  # "message" or "analysis"
+    data: Dict[str, Any]
+
+class AnalysisResult(BaseModel):
+    """Schema for analysis results."""
+    entities: List[Dict[str, Any]]
+    intents: List[Dict[str, Any]]
+    sentiment: Optional[Dict[str, float]] = None
+    summary: Optional[str] = None 

@@ -5,11 +5,16 @@ from typing import Optional, List, Dict
 from datetime import datetime
 import socket
 import subprocess
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class AIChat:
     def __init__(self, base_url: str = "http://localhost:8000"):
         self.base_url = base_url
-        self.conversation_id: Optional[int] = None
+        self.conversation_id: Optional[str] = None
         self.session = requests.Session()
         self.load_all_conversations()
 
@@ -20,13 +25,13 @@ class AIChat:
             response.raise_for_status()
             self.all_conversations = response.json()
             if self.all_conversations:
-                print(f"\nLoaded {len(self.all_conversations)} previous conversations.")
+                logger.info(f"Loaded {len(self.all_conversations)} previous conversations.")
         except requests.exceptions.RequestException as e:
             self.all_conversations = []
-            print(f"\nError loading conversations: {str(e)}")
-            print("Make sure the FastAPI server is running and accessible at", self.base_url)
+            logger.error(f"Error loading conversations: {str(e)}")
+            logger.error("Make sure the FastAPI server is running and accessible at", self.base_url)
 
-    def send_message(self, message: str) -> str:
+    def send_message(self, message: str) -> Dict[str, Any]:
         """Send a message to the AI and get the response."""
         try:
             response = self.session.post(
@@ -40,9 +45,10 @@ class AIChat:
             response.raise_for_status()
             data = response.json()
             self.conversation_id = data["conversation_id"]
-            return data["response"]
+            return data
         except requests.exceptions.RequestException as e:
-            return f"Error: {str(e)}"
+            logger.error(f"Error sending message: {str(e)}")
+            return {"response": f"Error: {str(e)}", "analysis": ""}
 
     def list_conversations(self) -> List[Dict]:
         """Get list of all conversations."""
@@ -50,16 +56,18 @@ class AIChat:
             response = self.session.get(f"{self.base_url}/api/v1/conversations")
             response.raise_for_status()
             return response.json()
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error listing conversations: {str(e)}")
             return []
 
-    def get_conversation(self, conversation_id: int) -> Dict:
+    def get_conversation(self, conversation_id: str) -> Dict:
         """Get details of a specific conversation."""
         try:
             response = self.session.get(f"{self.base_url}/api/v1/conversations/{conversation_id}")
             response.raise_for_status()
             return response.json()
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error getting conversation: {str(e)}")
             return {}
 
     def print_conversation_history(self, conversation: Dict):
@@ -71,9 +79,15 @@ class AIChat:
         print("\nConversation History:")
         for msg in conversation["messages"]:
             role = "You" if msg["role"] == "user" else "AI"
-            timestamp = datetime.fromisoformat(msg["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = datetime.fromisoformat(msg["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
             print(f"\n[{timestamp}] {role}:")
             print(msg["content"])
+            if "analysis" in msg:
+                print("\nAnalysis:")
+                print(msg["analysis"])
+            if "summary" in msg:
+                print("\nSummary:")
+                print(msg["summary"])
 
     def start_chat(self):
         """Start an interactive chat session."""
@@ -81,6 +95,8 @@ class AIChat:
         print("I remember all our previous conversations.")
         print("Type 'exit' or 'quit' to end the conversation.")
         print("Type 'new' to start a new conversation.")
+        print("Type 'list' to see all conversations.")
+        print("Type 'load <id>' to load a specific conversation.")
         print("Type 'help' to see available commands.\n")
 
         while True:
@@ -96,10 +112,32 @@ class AIChat:
                     print("\nStarted a new conversation!")
                     continue
                 
+                elif user_input.lower() == 'list':
+                    conversations = self.list_conversations()
+                    if conversations:
+                        print("\nAvailable conversations:")
+                        for conv in conversations:
+                            print(f"ID: {conv['id']} - Messages: {len(conv.get('messages', []))}")
+                    else:
+                        print("\nNo conversations found.")
+                    continue
+
+                elif user_input.lower().startswith('load '):
+                    conv_id = user_input[5:].strip()
+                    conversation = self.get_conversation(conv_id)
+                    if conversation:
+                        self.conversation_id = conv_id
+                        self.print_conversation_history(conversation)
+                    else:
+                        print(f"\nConversation {conv_id} not found.")
+                    continue
+                
                 elif user_input.lower() == 'help':
                     print("\nAvailable commands:")
                     print("  exit/quit - End the conversation")
                     print("  new      - Start a new conversation")
+                    print("  list     - Show all conversations")
+                    print("  load <id> - Load a specific conversation")
                     print("  help     - Show this help message")
                     continue
 
@@ -107,14 +145,20 @@ class AIChat:
                     continue
 
                 print("\nAI: ", end="", flush=True)
-                response = self.send_message(user_input)
-                print(response)
+                result = self.send_message(user_input)
+                print(result["response"])
+                if result.get("analysis"):
+                    print("\nAnalysis:")
+                    print(result["analysis"])
+                if result.get("summary"):
+                    print("\nSummary:")
+                    print(result["summary"])
 
             except KeyboardInterrupt:
                 print("\n\nGoodbye! Have a great day!")
                 break
             except Exception as e:
-                print(f"\nError: {str(e)}")
+                logger.error(f"Error in chat: {str(e)}")
                 continue
 
 def check_server_connection():
@@ -133,17 +177,17 @@ def check_server_connection():
                 if response.status_code == 200:
                     return True
                 else:
-                    print("Port 8000 is in use but not by a FastAPI server")
+                    logger.error("Port 8000 is in use but not by a FastAPI server")
                     return False
             except requests.exceptions.RequestException:
-                print("Port 8000 is in use but not responding correctly")
+                logger.error("Port 8000 is in use but not responding correctly")
                 return False
         else:
-            print("Port 8000 is not in use")
+            logger.error("Port 8000 is not in use")
             return False
             
     except socket.error as e:
-        print(f"Socket error: {str(e)}")
+        logger.error(f"Socket error: {str(e)}")
         return False
 
 def main():
