@@ -3,57 +3,43 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 from typing import List, Dict, Optional, Any
 import logging
-import os
 from datetime import datetime
 import json
-from uuid import uuid4
-import time
+import hashlib
 import numpy as np
 import traceback
+from transformers import AutoTokenizer
+import os
+import uuid
 
 logger = logging.getLogger(__name__)
 
 class VectorStore:
     def __init__(self, persist_directory: str = None):
-        """Initialize VectorStore with optional persistence"""
+        """Initialize VectorStore with optional persistence and token-based chunking."""
         self.initialized = False
         self.client = None
         self.collection = None
-        self.max_tokens = 512  # Maximum tokens per chunk
-        
+        self.max_tokens = 256  # Tune as desired
+        self.tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")  # Change model as needed
+
         try:
-            # Initialize ChromaDB client
-            if persist_directory:
-                logger.info(f"Initializing persistent VectorStore at {persist_directory}")
-                self.client = chromadb.PersistentClient(
-                    path=persist_directory,
-                    settings=Settings(
-                        anonymized_telemetry=False,
-                        allow_reset=True
-                    )
-                )
-            else:
-                logger.info("Initializing in-memory VectorStore")
-                self.client = chromadb.Client(
-                    settings=Settings(
-                        anonymized_telemetry=False,
-                        allow_reset=True
-                    )
-                )
-            
-            # Use a simpler embedding function
-            self.embedding_function = embedding_functions.DefaultEmbeddingFunction()
-            
-            # Get or create collection
+            if persist_directory is None:
+                persist_directory = "data/chroma"
+                os.makedirs(persist_directory, exist_ok=True)
+            logger.info(f"Initializing persistent VectorStore at {persist_directory}")
+            self.client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=Settings(anonymized_telemetry=False, allow_reset=True)
+            )
+            self.embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-mpnet-base-v2")
             self.collection = self.client.get_or_create_collection(
                 name="conversations",
                 embedding_function=self.embedding_function,
                 metadata={"hnsw:space": "cosine"}
             )
-            
             self.initialized = True
             logger.info("VectorStore initialized successfully")
-            
         except Exception as e:
             logger.error(f"Error initializing VectorStore: {str(e)}")
             logger.error(traceback.format_exc())
@@ -61,323 +47,342 @@ class VectorStore:
             raise
 
     def _convert_to_serializable(self, obj: Any) -> Any:
-        """Convert numpy types to Python native types for JSON serialization"""
+        """Convert numpy/datetime types to native types for JSON serialization."""
         if isinstance(obj, np.float32):
             return float(obj)
         elif isinstance(obj, np.ndarray):
             return obj.tolist()
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
         elif isinstance(obj, dict):
             return {k: self._convert_to_serializable(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self._convert_to_serializable(item) for item in obj]
-        return obj
+        elif isinstance(obj, (int, float, str, bool)):
+            return obj
+        else:
+            return str(obj)
 
     def _chunk_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Split messages into semantic chunks based on content"""
-        if not self.initialized:
-            logger.warning("VectorStore not initialized, returning single chunk")
-            return [{"messages": messages, "start_index": 0, "end_index": len(messages) - 1}]
-            
         chunks = []
-        current_chunk = []
-        
-        for msg in messages:
-            # If adding this message would exceed max_tokens, start a new chunk
-            if len(current_chunk) >= 2:  # Simple chunking: 2 messages per chunk
-                chunks.append({
-                    "messages": current_chunk.copy(),
-                    "start_index": len(chunks),
-                    "end_index": len(chunks) + len(current_chunk) - 1
-                })
-                current_chunk = []
-            
-            current_chunk.append(msg)
-        
-        # Add the last chunk if it's not empty
-        if current_chunk:
-            chunks.append({
-                "messages": current_chunk.copy(),
-                "start_index": len(chunks),
-                "end_index": len(chunks) + len(current_chunk) - 1
-            })
-        
+        i = 0
+        while i < len(messages) - 1:
+            # Pair user + assistant if possible
+            if messages[i]["role"] == "user" and messages[i+1]["role"] == "assistant":
+                chunks.append({"messages": [messages[i], messages[i+1]]})
+                i += 2
+            else:
+                # Just take one message if not a pair
+                chunks.append({"messages": [messages[i]]})
+                i += 1
+        if i < len(messages):
+            chunks.append({"messages": [messages[i]]})
         return chunks
 
+    def _chunk_id(self, conversation_id: str, chunk: Dict[str, Any]) -> str:
+        """Create a unique chunk id based on content hash."""
+        # Convert numpy types to Python native types
+        def convert_numpy(obj):
+            if isinstance(obj, np.float32):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: convert_numpy(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy(item) for item in obj]
+            return obj
+
+        # Convert any numpy types in the messages
+        converted_messages = convert_numpy(chunk['messages'])
+        chunk_json = json.dumps(converted_messages, sort_keys=True)
+        chunk_hash = hashlib.sha1(chunk_json.encode('utf-8')).hexdigest()
+        return f"{conversation_id}_chunk_{chunk_hash}"
+
     def _create_chunk_context(self, chunk: Dict[str, Any]) -> str:
-        """Create a rich context for a chunk of messages"""
+        """Build a printable context string for a chunk of messages."""
         context_parts = []
-        
-        # Add message content
         for msg in chunk["messages"]:
             role = "User" if msg["role"] == "user" else "Assistant"
             content = msg["content"]
-            if "analysis" in msg:
+            if "analysis" in msg and msg["analysis"]:
                 content += f"\nAnalysis: {msg['analysis']}"
-            if "summary" in msg:
+            if "summary" in msg and msg["summary"]:
                 content += f"\nSummary: {msg['summary']}"
             context_parts.append(f"{role}: {content}")
-        
         return "\n\n".join(context_parts)
 
-    def add_conversation(self, conversation):
-        """Add a conversation to the vector store with enhanced chunk-level storage"""
-        if not self.initialized:
-            logger.warning("VectorStore not initialized, skipping conversation storage")
-            return
-            
+    def add_conversation(self, conversation: Dict[str, Any]) -> None:
+        """Add a conversation to the vector store using unique IDs per chunk (SHA1)."""
         try:
-            # Convert messages to list of dicts
-            messages = [
-                {
-                    "role": msg.role,
-                    "content": msg.content,
-                    "analysis": msg.analysis if msg.analysis else {}
-                }
-                for msg in conversation.messages
-            ]
-            
-            # Create semantic chunks
-            chunks = self._chunk_messages(messages)
-            
-            # Prepare documents and metadata for each chunk
-            documents = []
-            metadatas = []
-            ids = []
-            
+            if not conversation or not isinstance(conversation, dict):
+                raise ValueError("Invalid conversation format")
+            conversation_id = conversation.get('id')
+            if not conversation_id:
+                raise ValueError("Conversation must have an ID")
+
+            # Delete old conversation, if it exists (safe: prevents duplicate IDs)
+            existing = self.collection.get(where={"conversation_id": conversation_id})
+            if existing and existing['ids']:
+                self.collection.delete(where={"conversation_id": conversation_id})
+
+            # Chunk messages and add with unique hash IDs
+            chunks = self._chunk_messages(conversation.get('messages', []))
+            documents, metadatas, ids = [], [], []
             for chunk in chunks:
-                # Create a unique ID for each chunk
-                chunk_id = f"{conversation.id}_{chunk['start_index']}_{chunk['end_index']}"
+                chunk_id = self._chunk_id(conversation_id, chunk)
                 
-                # Create rich context for the chunk
+                # Convert numpy types in messages before JSON serialization
+                converted_messages = self._convert_to_serializable(chunk['messages'])
+                
+                metadata = {
+                    "conversation_id": conversation_id,
+                    "chunk_start": chunk.get('start_index', 0),
+                    "chunk_end": chunk.get('end_index', 0),
+                    "message_count": len(conversation.get('messages', [])),
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "type": "messages",
+                    "messages_json": json.dumps(converted_messages),
+                    "chunk_hash": chunk_id.split('_chunk_')[-1]
+                }
+                
+                # Add any additional metadata from the conversation
+                for key, value in conversation.items():
+                    if key not in ['id', 'messages']:
+                        metadata[key] = self._convert_to_serializable(value)
+                
                 context = self._create_chunk_context(chunk)
-                
-                # Convert chunk messages to JSON string, handling numpy types
-                serializable_messages = self._convert_to_serializable(chunk['messages'])
-                messages_json = json.dumps(serializable_messages)
-                
-                # Check if this chunk already exists
-                existing = self.collection.get(ids=[chunk_id])
-                if existing and existing['ids']:
-                    # Update existing chunk
-                    self.collection.update(
-                        ids=[chunk_id],
-                        documents=[context],
-                        metadatas=[{
-                            "conversation_id": conversation.id,
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "message_count": len(chunk['messages']),
-                            "messages_json": messages_json,
-                            "chunk_start": chunk['start_index'],
-                            "chunk_end": chunk['end_index']
-                        }]
-                    )
-                    logger.debug(f"Updated existing chunk {chunk_id}")
-                else:
-                    # Add new chunk
-                    documents.append(context)
-                    metadatas.append({
-                        "conversation_id": conversation.id,
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "message_count": len(chunk['messages']),
-                        "messages_json": messages_json,
-                        "chunk_start": chunk['start_index'],
-                        "chunk_end": chunk['end_index']
-                    })
-                    ids.append(chunk_id)
-            
-            # Add all new chunks to vector store
+                documents.append(context)
+                metadatas.append(metadata)
+                ids.append(chunk_id)
+
             if documents:
                 self.collection.add(
                     documents=documents,
                     metadatas=metadatas,
                     ids=ids
                 )
-                logger.debug(f"Added {len(documents)} new chunks to vector store")
-            
-            logger.debug(f"Processed conversation {conversation.id} with {len(chunks)} chunks")
+
+            # Store summary with a single unique ID per conversation
+            if 'summary' in conversation and conversation['summary']:
+                summary_id = f"{conversation_id}_summary"
+                self.collection.add(
+                    documents=[conversation['summary']],
+                    metadatas=[{
+                        "conversation_id": conversation_id,
+                        "type": "summary",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }],
+                    ids=[summary_id]
+                )
+
         except Exception as e:
             logger.error(f"Error adding conversation to vector store: {str(e)}")
-            logger.error(traceback.format_exc())
             raise
 
     def get_similar_conversations(
         self,
         query: str,
         limit: int = 5,
-        min_similarity: float = 0.7
+        min_similarity: float = 0.2
     ) -> List[Dict[str, Any]]:
-        """Get similar conversations from the vector store"""
+        """Retrieve similar conversations from the vector store."""
         if not self.initialized:
             logger.warning("VectorStore not initialized, returning empty list")
             return []
-            
         try:
-            # Search for similar chunks
             results = self.collection.query(
                 query_texts=[query],
-                n_results=limit * 2  # Get more results initially for filtering
+                n_results=limit * 2
             )
-            
-            # Process and deduplicate results
-            conversation_map = {}  # Map to store unique conversations
-            
-            for i, (chunk_id, distance) in enumerate(zip(results['ids'][0], results['distances'][0])):
-                similarity = 1 - distance  # Convert distance to similarity
-                
-                # Skip if similarity is too low
+            conversation_map = {}
+            for chunk_id, distance in zip(results['ids'][0], results['distances'][0]):
+                similarity = 1 - distance
                 if similarity < min_similarity:
                     continue
                     
-                # Get metadata for the chunk
+                # Get metadata and skip if no conversation_id
                 metadata = self.collection.get(ids=[chunk_id])['metadatas'][0]
-                conversation_id = metadata['conversation_id']
-                
-                # If we haven't seen this conversation or this chunk has higher similarity
-                if conversation_id not in conversation_map or similarity > conversation_map[conversation_id]['similarity']:
-                    # Get all chunks for this conversation
-                    conv_chunks = self.collection.get(
-                        where={"conversation_id": conversation_id}
-                    )
+                if 'conversation_id' not in metadata:
+                    logger.warning(f"Skipping chunk {chunk_id} without conversation_id")
+                    continue
                     
-                    # Sort chunks by their position
+                conversation_id = metadata['conversation_id']
+                if conversation_id not in conversation_map or similarity > conversation_map[conversation_id]['similarity']:
+                    conv_chunks = self.collection.get(
+                        where={
+                            "$and": [
+                                {"conversation_id": {"$eq": conversation_id}},
+                                {"type": {"$eq": "messages"}}
+                            ]
+                        }
+                    )
                     chunks = []
-                    for j, chunk_metadata in enumerate(conv_chunks['metadatas']):
+                    for chunk_metadata in conv_chunks['metadatas']:
                         chunk_data = {
                             'messages': json.loads(chunk_metadata['messages_json']),
                             'chunk_start': chunk_metadata['chunk_start'],
                             'chunk_end': chunk_metadata['chunk_end']
                         }
                         chunks.append(chunk_data)
-                    
                     chunks.sort(key=lambda x: x['chunk_start'])
-                    
-                    # Store conversation with its best similarity score
                     conversation_map[conversation_id] = {
                         'id': conversation_id,
                         'chunks': chunks,
                         'similarity': similarity
                     }
-                
-                # Break if we have enough unique conversations
                 if len(conversation_map) >= limit:
                     break
-            
-            # Convert map to sorted list
             conversations = list(conversation_map.values())
             conversations.sort(key=lambda x: x['similarity'], reverse=True)
-            
             logger.debug(f"Found {len(conversations)} similar conversations")
             return conversations
-
         except Exception as e:
             logger.error(f"Error getting similar conversations: {str(e)}")
             logger.error(traceback.format_exc())
             return []
 
+    def get_conversation_summaries(self, conversation_id: str) -> List[str]:
+        """Retrieve all summaries for a given conversation."""
+        if not self.initialized:
+            return []
+        try:
+            results = self.collection.get(where={"conversation_id": conversation_id, "type": "summary"})
+            return results.get('documents', [])
+        except Exception as e:
+            logger.error(f"Error fetching summaries: {str(e)}")
+            return []
+
     def get_all_conversations(self) -> List[Dict[str, Any]]:
-        """Retrieve all conversations from the vector store with enhanced metadata"""
+        """Retrieve all conversations with their chunks and summaries."""
         if not self.initialized:
             logger.warning("VectorStore not initialized, returning empty list")
             return []
-            
         try:
             results = self.collection.get()
-            
             if not results or not results["ids"]:
                 logger.debug("No conversations found in vector store")
                 return []
-            
-            # Group chunks by conversation
             conversations = {}
             for id, doc, meta in zip(results["ids"], results["documents"], results["metadatas"]):
+                # Skip entries without conversation_id
+                if "conversation_id" not in meta:
+                    logger.warning(f"Skipping entry {id} without conversation_id")
+                    continue
+                    
                 conv_id = meta["conversation_id"]
                 if conv_id not in conversations:
                     conversations[conv_id] = {
                         "id": conv_id,
                         "chunks": [],
+                        "summaries": [],
                         "metadata": {
                             "timestamp": meta.get("timestamp"),
-                            "message_count": 0
+                            "message_count": meta.get("message_count", 0),
+                            "total_chunks": 0
                         }
                     }
-                
-                # Parse messages from JSON
-                messages = json.loads(meta.get("messages_json", "[]"))
-                conversations[conv_id]["chunks"].append({
-                    "content": doc,
-                    "messages": messages,
-                    "chunk_start": meta.get("chunk_start"),
-                    "chunk_end": meta.get("chunk_end")
-                })
-                conversations[conv_id]["metadata"]["message_count"] += len(messages)
-            
-            # Convert to list and sort by timestamp
+                if meta.get("type") == "summary":
+                    conversations[conv_id]["summaries"].append({
+                        "content": doc,
+                        "chunk_index": meta.get("chunk_index", 0)
+                    })
+                else:
+                    messages = json.loads(meta.get("messages_json", "[]"))
+                    conversations[conv_id]["chunks"].append({
+                        "content": doc,
+                        "messages": messages,
+                        "chunk_start": meta.get("chunk_start", 0),
+                        "chunk_end": meta.get("chunk_end", 0),
+                        "chunk_index": meta.get("chunk_index", 0)
+                    })
+                    conversations[conv_id]["metadata"]["total_chunks"] = max(
+                        conversations[conv_id]["metadata"]["total_chunks"],
+                        meta.get("chunk_index", 0) + 1
+                    )
+            for conv in conversations.values():
+                conv["chunks"].sort(key=lambda x: x["chunk_index"])
+                conv["summaries"].sort(key=lambda x: x["chunk_index"])
             conversation_list = list(conversations.values())
             conversation_list.sort(key=lambda x: x["metadata"]["timestamp"], reverse=True)
-            
             return conversation_list
-            
         except Exception as e:
             logger.error(f"Error getting all conversations: {str(e)}")
             logger.error(traceback.format_exc())
             return []
 
-    def store_message(self, message_id: int, conversation_id: int, content: str, role: str):
-        """Store a message in the vector database."""
-        try:
-            logger.debug(f"Storing message {message_id} in vector database")
-            logger.debug(f"Content: {content[:100]}...")  # Log first 100 chars
+    def store_message(self, message: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Store a single message in the vector store."""
+        if not message or not isinstance(message, dict):
+            raise ValueError("Invalid message format")
             
-            self.collection.add(
-                documents=[content],
-                metadatas=[{
-                    "message_id": message_id,
-                    "conversation_id": conversation_id,
-                    "role": role
-                }],
-                ids=[f"msg_{message_id}"]
-            )
+        # Convert numpy types in message
+        message = self._convert_to_serializable(message)
+        
+        # Create unique ID for the message
+        message_id = f"msg_{uuid.uuid4()}"
+        
+        # Prepare metadata
+        msg_metadata = {
+            "type": "message",
+            "role": message.get("role", "unknown"),
+            "timestamp": datetime.utcnow().isoformat(),
+            "conversation_id": message.get("conversation_id", "unknown")
+        }
+        
+        if metadata:
+            msg_metadata.update(metadata)
             
-            logger.debug(f"Successfully stored message {message_id} in vector database")
-            # Log the count of messages in the collection
-            count = self.collection.count()
-            logger.debug(f"Total messages in collection: {count}")
+        # Store the message
+        self.collection.add(
+            documents=[message.get("content", "")],
+            metadatas=[msg_metadata],
+            ids=[message_id]
+        )
+        
+        return message_id
+
+    def store_summary(self, summary: str, metadata: Dict[str, Any]) -> str:
+        """Store a conversation summary in the vector store."""
+        if not summary:
+            raise ValueError("Summary cannot be empty")
             
-        except Exception as e:
-            logger.error(f"Error storing message in vector database: {str(e)}")
-            logger.error("Full traceback:")
-            logger.error(traceback.format_exc())
-            raise
+        # Ensure conversation_id is present
+        if "conversation_id" not in metadata:
+            raise ValueError("conversation_id is required in metadata")
+            
+        # Create unique ID for the summary
+        summary_id = f"summary_{uuid.uuid4()}"
+        
+        # Ensure required metadata fields
+        metadata.update({
+            "type": "summary",
+            "timestamp": metadata.get("timestamp", datetime.utcnow().isoformat())
+        })
+        
+        # Store the summary
+        self.collection.add(
+            documents=[summary],
+            metadatas=[metadata],
+            ids=[summary_id]
+        )
+        
+        return summary_id
 
     def get_relevant_messages(self, query: str, conversation_id: Optional[int] = None, limit: int = 5) -> List[Dict]:
-        """Retrieve relevant messages based on semantic similarity."""
+        """Retrieve relevant messages from the vector database."""
         try:
-            logger.debug(f"Searching for messages relevant to: {query[:100]}...")  # Log first 100 chars
-            
-            # Get total count before querying
             total_count = self.collection.count()
-            logger.debug(f"Total messages in collection: {total_count}")
-            
-            # If there are no messages, return empty list
             if total_count == 0:
-                logger.debug("No messages in collection, returning empty list")
                 return []
-            
-            # Prepare where clause if conversation_id is provided
             where = {"conversation_id": conversation_id} if conversation_id else None
-            if where:
-                logger.debug(f"Filtering by conversation_id: {conversation_id}")
-            
-            # Query the collection
             results = self.collection.query(
                 query_texts=[query],
-                n_results=min(limit, total_count),  # Don't request more than we have
+                n_results=min(limit, total_count),
                 where=where
             )
-            
-            # Format results
             messages = []
-            if results['ids'] and results['ids'][0]:  # Check if we have any results
+            if results['ids'] and results['ids'][0]:
                 for i in range(len(results['ids'][0])):
                     message = {
                         "content": results['documents'][0][i],
@@ -385,14 +390,9 @@ class VectorStore:
                         "distance": results['distances'][0][i] if 'distances' in results else None
                     }
                     messages.append(message)
-                    logger.debug(f"Found relevant message: {message['content'][:100]}...")  # Log first 100 chars
-            
-            logger.debug(f"Retrieved {len(messages)} relevant messages")
             return messages
-            
         except Exception as e:
             logger.error(f"Error retrieving messages from vector database: {str(e)}")
-            logger.error("Full traceback:")
             logger.error(traceback.format_exc())
             raise
 
@@ -406,10 +406,10 @@ class VectorStore:
             raise
 
     def delete_conversation(self, conversation_id: int):
-        """Delete all messages from a conversation."""
+        """Delete all messages and summaries from a conversation."""
         try:
             self.collection.delete(where={"conversation_id": conversation_id})
             logger.debug(f"Deleted conversation {conversation_id} from vector database")
         except Exception as e:
             logger.error(f"Error deleting conversation from vector database: {str(e)}")
-            raise 
+            raise

@@ -1,6 +1,7 @@
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uuid
+from datetime import datetime
 
 class Message(BaseModel):
     """Represents a single message in a conversation"""
@@ -8,16 +9,21 @@ class Message(BaseModel):
     content: str
     analysis: Optional[Dict[str, Any]] = None
     similar_conversations: Optional[List[Dict[str, Any]]] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 class Conversation(BaseModel):
     """Represents a conversation with multiple messages"""
     id: str
     messages: List[Message] = []
     summary: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
     def add_message(self, message: Message) -> None:
         """Add a message to the conversation"""
         self.messages.append(message)
+        self.updated_at = datetime.utcnow()
 
     def get_last_message(self) -> Optional[Message]:
         """Get the last message in the conversation"""

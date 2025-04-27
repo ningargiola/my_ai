@@ -1,218 +1,119 @@
 from typing import List, Dict, Any
 import logging
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import uuid
 import json
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 class Summarizer:
-    def __init__(self):
-        """Initialize the summarizer with a pre-trained model."""
-        try:
-            # Use a more appropriate model for conversation summarization
-            self.model_name = "facebook/bart-large-cnn"
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
-            self.summarizer = pipeline(
-                "summarization",
-                model=self.model,
-                tokenizer=self.tokenizer,
-                device=0 if torch.cuda.is_available() else -1
-            )
-            logger.info("Summarizer initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing summarizer: {str(e)}")
-            raise
+    def __init__(self, vector_store=None):
+        self.model_name = "Falconsai/text_summarization"
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+        self.summarizer = pipeline(
+            "summarization",
+            model=self.model,
+            tokenizer=self.tokenizer,
+            device=0 if torch.cuda.is_available() else -1
+        )
+        self.vector_store = vector_store  # Optionally inject
 
     def _format_conversation(self, messages: List[Dict[str, Any]]) -> str:
-        """Format conversation messages into a coherent text"""
-        try:
-            formatted_messages = []
-            current_speaker = None
-            current_content = []
+        formatted_messages = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get('role', 'unknown').capitalize()
+            content = msg.get('content', '')
             
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    logger.warning(f"Skipping invalid message format: {msg}")
-                    continue
-                    
-                role = msg.get('role', 'unknown').capitalize()
-                content = msg.get('content', '')
+            # Format the message
+            message_parts = [f"{role}: {content}"]
+            
+            # Add analysis if present
+            if 'analysis' in msg and isinstance(msg['analysis'], dict):
+                analysis = msg['analysis']
+                entities = analysis.get('entities', {})
+                intent = analysis.get('intent', {})
                 
-                # If speaker changes, add previous content and start new
-                if role != current_speaker and current_speaker is not None:
-                    formatted_messages.append(f"{current_speaker}: {' '.join(current_content)}")
-                    current_content = []
+                analysis_parts = []
+                # Add entities
+                for entity_type, values in entities.items():
+                    if values:
+                        analysis_parts.append(f"{entity_type}: {', '.join(values)}")
+                # Add intents with high confidence
+                for intent_type, score in intent.items():
+                    if score > 0.3:
+                        analysis_parts.append(f"{intent_type}: {score:.2f}")
                 
-                current_speaker = role
-                current_content.append(content)
-                
-                # Add analysis if available
-                if 'analysis' in msg and isinstance(msg['analysis'], dict):
-                    analysis = msg['analysis']
-                    entities = analysis.get('entities', {})
-                    intent = analysis.get('intent', {})
-                    
-                    # Format entities
-                    entity_text = []
-                    if 'PERSON' in entities:
-                        entity_text.append(f"People mentioned: {', '.join(entities['PERSON'])}")
-                    if 'ORG' in entities:
-                        entity_text.append(f"Organizations mentioned: {', '.join(entities['ORG'])}")
-                    
-                    # Format intent
-                    intent_text = []
-                    for intent_type, score in intent.items():
-                        if score > 0.3:  # Only include significant intents
-                            intent_text.append(f"{intent_type}: {score:.2f}")
-                    
-                    if entity_text or intent_text:
-                        current_content.append(f"[Analysis: {' | '.join(entity_text + intent_text)}]")
+                if analysis_parts:
+                    message_parts.append(f"[Analysis: {' | '.join(analysis_parts)}]")
             
-            # Add the last message
-            if current_speaker and current_content:
-                formatted_messages.append(f"{current_speaker}: {' '.join(current_content)}")
-            
-            return "\n\n".join(formatted_messages)
-        except Exception as e:
-            logger.error(f"Error formatting conversation: {str(e)}")
-            return ""
-
-    def _calculate_summary_length(self, text: str) -> tuple[int, int]:
-        """Calculate appropriate summary lengths based on input text"""
-        try:
-            if not text:
-                return 50, 25
-                
-            # Count tokens in the input text
-            tokens = self.tokenizer.encode(text, truncation=True, max_length=1024)
-            input_length = len(tokens)
-            
-            # Calculate max and min lengths based on input length
-            if input_length < 100:
-                max_length = min(30, input_length // 2)
-                min_length = min(15, max_length // 2)
-            elif input_length < 500:
-                max_length = min(100, input_length // 3)
-                min_length = min(50, max_length // 2)
-            else:
-                max_length = 150
-                min_length = 75
-                
-            return max_length, min_length
-        except Exception as e:
-            logger.error(f"Error calculating summary length: {str(e)}")
-            return 100, 50  # Default values if calculation fails
-
-    def _post_process_summary(self, summary: str, messages: List[Dict[str, Any]]) -> str:
-        """Post-process the summary to ensure accuracy and coherence"""
-        try:
-            if not summary:
-                return "Unable to generate summary at this time."
-                
-            # Extract key information from the conversation
-            user_name = None
-            assistant_name = None
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get('role') == 'user':
-                    content = msg.get('content', '').lower()
-                    if 'my name is' in content:
-                        user_name = content.split('my name is')[1].split()[0].strip()
-                elif msg.get('role') == 'assistant':
-                    content = msg.get('content', '').lower()
-                    if 'alias' in content:
-                        assistant_name = 'ALIAS'
-            
-            # Fix any name/role confusions
-            if user_name and assistant_name:
-                summary = summary.replace(f"{assistant_name} is", f"I am")
-                summary = summary.replace(f"{user_name} is", f"You are")
-            
-            # Ensure proper sentence endings
-            summary = summary.strip()
-            if not summary.endswith(('.', '!', '?')):
-                summary += '.'
-            
-            return summary
-        except Exception as e:
-            logger.error(f"Error post-processing summary: {str(e)}")
-            return summary
+            formatted_messages.append(" ".join(message_parts))
+        
+        return "\n".join(formatted_messages)
 
     def summarize_conversation(self, messages: List[Dict[str, Any]]) -> str:
-        """Generate a high-quality summary of the conversation"""
+        """Generate a summary of the conversation."""
         try:
-            if not messages:
-                return "No messages to summarize."
-                
-            # Format the conversation
-            conversation_text = self._format_conversation(messages)
-            if not conversation_text:
-                return "Unable to format conversation for summary."
-            
-            # Calculate appropriate lengths
-            max_length, min_length = self._calculate_summary_length(conversation_text)
-            
-            # Generate summary with improved parameters
-            try:
-                summary_result = self.summarizer(
-                    conversation_text,
-                    max_length=max_length,
-                    min_length=min_length,
-                    do_sample=False,
-                    num_beams=4,
-                    length_penalty=2.0,
-                    no_repeat_ngram_size=3,
-                    early_stopping=True
-                )
-                if not summary_result or not isinstance(summary_result, list) or not summary_result:
-                    return "Unable to generate summary at this time."
-                    
-                summary = summary_result[0].get('summary_text', '')
-                if not summary:
-                    return "Generated summary is empty."
-            except Exception as e:
-                logger.error(f"Error in summarization pipeline: {str(e)}")
-                return "Error during summarization process."
-            
-            # Post-process the summary
-            summary = self._post_process_summary(summary, messages)
-            
-            logger.debug(f"Generated summary: {summary}")
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Error generating summary: {str(e)}")
-            return "Unable to generate summary at this time."
-
-    def generate_key_points(self, messages: List[Dict[str, Any]], num_points: int = 3) -> List[str]:
-        """Extract key points from the conversation"""
-        try:
-            if not messages:
-                return []
-
-            # Format messages into a single text
-            text_to_analyze = "\n".join([
-                f"{msg['role']}: {msg['content']}"
+            # Convert messages to text format
+            conversation_text = "\n".join([
+                f"{msg['role'].capitalize()}: {msg['content']}"
                 for msg in messages
             ])
-
-            # Generate a longer summary for key points extraction
+            
+            # Generate summary
             summary = self.summarizer(
-                text_to_analyze,
-                max_length=200,
-                min_length=100,
+                conversation_text,
+                min_length=50,
                 do_sample=False
-            )[0]["summary_text"]
-
-            # Split summary into sentences and take the first num_points
-            key_points = summary.split(". ")
-            key_points = [point.strip() + "." for point in key_points[:num_points]]
-
-            return key_points
+            )[0]['summary_text']
+            
+            # Store summary in vector store with serialized metadata
+            if self.vector_store:
+                # Convert analysis data to string if present
+                serialized_analysis = {}
+                for msg in messages:
+                    if 'analysis' in msg and isinstance(msg['analysis'], dict):
+                        serialized_analysis[msg['role']] = json.dumps(msg['analysis'])
+                
+                # Get conversation_id from first message
+                conversation_id = None
+                for msg in messages:
+                    if 'conversation_id' in msg:
+                        conversation_id = msg['conversation_id']
+                        break
+                
+                if not conversation_id:
+                    logger.warning("No conversation_id found in messages, generating a new one")
+                    conversation_id = str(uuid.uuid4())
+                
+                metadata = {
+                    "type": "summary",
+                    "conversation_id": conversation_id,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "message_count": len(messages),
+                    "analysis": json.dumps(serialized_analysis) if serialized_analysis else "{}"
+                }
+                self.vector_store.store_summary(summary, metadata)
+            
+            return summary
         except Exception as e:
-            logger.error(f"Error generating key points: {str(e)}")
-            return [] 
+            logger.error(f"Error generating summary: {str(e)}")
+            return "Error generating conversation summary."
+
+    def generate_key_points(self, messages: List[Dict[str, Any]], num_points: int = 3) -> List[str]:
+        if not messages:
+            return []
+        text_to_analyze = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])
+        summary = self.summarizer(
+            text_to_analyze,
+            max_length=200,
+            min_length=100,
+            do_sample=False
+        )[0]["summary_text"]
+        key_points = summary.split(". ")
+        key_points = [point.strip() + "." for point in key_points[:num_points]]
+        return key_points
