@@ -67,7 +67,7 @@ Once the server is running, visit [`http://localhost:8000/docs`](http://localhos
 
 ## Architecture & Developer Docs
 
-See [architecture.md](architecture.md) for a full breakdown of:
+See [architecture.md](docs/architecture.md) for a full breakdown of:
 - Codebase structure
 - End-to-end workflows
 - Service documentation
